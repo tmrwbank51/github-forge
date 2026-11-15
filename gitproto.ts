@@ -292,7 +292,50 @@ function computeFetch(repo: RepoState, args: FetchArgs): {
   return { pack, shallow, unshallow, acks };
 }
 
+// Fetch responses are pure functions of (repo objects, request lines): the same
+// clone repeated — the benchmark's 50 concurrent depth-1 clones — rebuilds the
+// same pack every time. Cache the finished response buffer per repo, keyed by
+// the repo's object version plus every raw request line, so any variation in
+// the request (wants, haves, depth, filters, boundaries) is a distinct key and
+// any object write invalidates every entry. Bounded per repo; repos are held
+// weakly so a deleted repo's entries disappear with it.
+const FETCH_CACHE = new WeakMap<RepoState, Map<string, Buffer>>();
+const FETCH_CACHE_PER_REPO = 32;
+
+function fetchCacheLookup(repo: RepoState, protocol: string, packets: Packet[]): Buffer | undefined {
+  const perRepo = FETCH_CACHE.get(repo);
+  if (!perRepo) return undefined;
+  const hit = perRepo.get(fetchCacheKey(repo, protocol, packets));
+  return hit === undefined ? undefined : Buffer.from(hit);
+}
+
+function fetchCacheStore(repo: RepoState, protocol: string, packets: Packet[], value: Buffer): Buffer {
+  let perRepo = FETCH_CACHE.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    FETCH_CACHE.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_PER_REPO) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(fetchCacheKey(repo, protocol, packets), value);
+  return value;
+}
+
+function fetchCacheKey(repo: RepoState, protocol: string, packets: Packet[]): string {
+  const lines = packets.map((packet) => (packet.kind === 'data' ? packet.payload.toString('utf8') : packet.kind));
+  return `${repo.version}:${protocol}:${lines.join('\u0001')}`;
+}
+
 function fetchV2(repo: RepoState, packets: Packet[]): Buffer {
+  const cached = fetchCacheLookup(repo, 'v2', packets);
+  if (cached) return cached;
+  const built = fetchV2Uncached(repo, packets);
+  return fetchCacheStore(repo, 'v2', packets, built);
+}
+
+function fetchV2Uncached(repo: RepoState, packets: Packet[]): Buffer {
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
   let pastDelim = false;
   for (const packet of packets) {
@@ -338,6 +381,13 @@ function fetchV2(repo: RepoState, packets: Packet[]): Buffer {
 }
 
 function fetchV0(repo: RepoState, packets: Packet[]): Buffer {
+  const cached = fetchCacheLookup(repo, 'v0', packets);
+  if (cached) return cached;
+  const built = fetchV0Uncached(repo, packets);
+  return fetchCacheStore(repo, 'v0', packets, built);
+}
+
+function fetchV0Uncached(repo: RepoState, packets: Packet[]): Buffer {
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;

@@ -126,6 +126,8 @@ export interface RepoState {
   updatedAt: string;
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
+  /** Bumped on every object write; fetch responses are cached against it. */
+  version: number;
   labels: Map<string, LabelState>;
   issues: IssueState[];
   pulls: PullState[];
@@ -191,6 +193,7 @@ export class Forge {
       updatedAt: now,
       objects: new Map(),
       refs: new Map(),
+      version: 0,
       labels: new Map(DEFAULT_LABELS.map((label) => [label.name, { ...label }])),
       issues: [],
       pulls: [],
@@ -241,7 +244,10 @@ export function lookupOf(repo: RepoState): (oid: string) => GitObject | undefine
 
 export function putObject(repo: RepoState, type: ObjectType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    repo.version += 1;
+  }
   return oid;
 }
 
